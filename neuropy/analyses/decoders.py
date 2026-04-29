@@ -218,11 +218,6 @@ class Decode1d:
                 marginal_posterior = np.sum(self.hmm_joint_posterior, axis=0)
 
         elif self.decoder_mode == 'DD':
-            stay_prob = self.hmm_params.get('stay_prob', 0.98)
-            switch_prob = (1.0 - stay_prob) / 2.0
-            trans_state = np.full((3, 3), switch_prob, dtype=np.float64)
-            np.fill_diagonal(trans_state, stay_prob)
-
             spatial_post_list = []
             joint_list, state_prob_list = [], []
             opt_stay_list, opt_v_list, opt_sig_list, max_ll_list = [], [], [], []
@@ -237,7 +232,7 @@ class Decode1d:
                     opt_sig_list.append(np.nan); max_ll_list.append(np.nan)
                     continue
 
-                opt_stay, opt_v, opt_sig, max_ll, acausal_joint = self.decode_with_3state_dd_optimizer(seq_like, self.time_bin_size, trans_state)
+                opt_stay, opt_v, opt_sig, max_ll, acausal_joint = self.decode_with_3state_dd_optimizer(seq_like, self.time_bin_size)
                 spatial_post_list.append(np.sum(acausal_joint, axis=0))
                 joint_list.append(acausal_joint)
                 state_prob_list.append(np.sum(acausal_joint, axis=1))
@@ -748,7 +743,7 @@ class Decode1d:
         state_prob = np.sum(acausal_joint, axis=1)
         return acausal_joint, state_prob
 
-    def decode_with_3state_dd_optimizer(self, seq_likelihood, dt, trans_state):
+    def decode_with_3state_dd_optimizer(self, seq_likelihood, dt):
         """Wrapper to run the 3-state Drift-Diffusion Switching HMM.
 
         Fits stay_prob, velocity (*v*) and diffusion (*sigma*) per event
@@ -760,9 +755,6 @@ class Decode1d:
             Neural likelihood for one event, shape ``(n_bins, n_time)``.
         dt : float
             Time bin size (seconds).
-        trans_state : np.ndarray
-            Initial discrete state transition matrix, shape ``(3, 3)``.
-            Used only as a template; ``stay_prob`` is fitted jointly.
 
         Returns
         -------
