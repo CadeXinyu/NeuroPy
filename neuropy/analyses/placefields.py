@@ -80,10 +80,10 @@ class Pf1D(core.Ratemap):
         
         self.grid_bin = grid_bin
         
-        # Define smoothing function
+        # Define smoothing function (with explicit float casting to prevent integer truncation)
         if mode == 'circular' and sigma_bin > 0:
             def smooth_(f):
-                f = np.asarray(f)
+                f = np.asarray(f, dtype=float)
                 is_1d = f.ndim == 1
                 if is_1d:
                     f = f.reshape(1, -1)
@@ -96,8 +96,10 @@ class Pf1D(core.Ratemap):
                     smoothed = smoothed.squeeze()
                 return smoothed
         else:
+            from scipy.ndimage import gaussian_filter1d
             smooth_ = lambda f: (
-                gaussian_filter1d(f, sigma_bin / grid_bin, axis=-1) if sigma_bin > 0 else f
+                gaussian_filter1d(np.asarray(f, dtype=float), sigma_bin / grid_bin, axis=-1) 
+                if sigma_bin > 0 else np.asarray(f, dtype=float)
             )
         
         # Extract spikes and position based on epochs or speed threshold
@@ -117,8 +119,13 @@ class Pf1D(core.Ratemap):
                 for epc in epochs.to_dataframe().itertuples()
             ])
             
+            # --- FIX 1: Apply speed threshold to epoch occupancy indices ---
+            if speed_thresh is not None:
+                valid_speed_mask = speed[indx] >= speed_thresh
+                indx = indx[valid_speed_mask]
+            
             if verbose:
-                print("Note: speed_thresh is ignored to cal epoch when epochs is provided, but will used to sort spike")
+                print("Note: speed_thresh is correctly applied to BOTH spikes and epoch occupancy.")
         else:
             spiketrains = neurons.time_slice(t_start, t_stop).spiketrains
             indx = np.where(speed >= speed_thresh)[0]
@@ -130,28 +137,53 @@ class Pf1D(core.Ratemap):
         for spktrn in spiketrains:
             spk_spd = np.interp(spktrn, t, speed)
 
-            # Handle circular vs linear position interpolation
+            # --- FIX 2: Use nearest-neighbor matching for circular tracks ---
             if mode == 'circular' and x_range > 0:
-                spk_phases = interpolate_phase_circular(t, x, spktrn)
-                spk_x = np.mod(spk_phases, 2 * np.pi)
+                # Find indices of nearest neighbors in time (t)
+                indices = np.searchsorted(t, spktrn)
+                indices = np.clip(indices, 0, len(t) - 1)
+                prev_indices = np.clip(indices - 1, 0, len(t) - 1)
+                
+                dist = np.abs(t[indices] - spktrn)
+                dist_prev = np.abs(t[prev_indices] - spktrn)
+                
+                # Choose the index that is closer in time
+                closer_indx = np.where(dist < dist_prev, indices, prev_indices)
+                spk_x = x[closer_indx]  # Use raw discontinuous x trace directly
             else:
                 spk_x = np.interp(spktrn, t, x)
             
             # Apply speed threshold to spikes
             if speed_thresh is not None:
-                indices = np.where(spk_spd >= speed_thresh)[0]
-                spk_x = spk_x[indices]
-                spktrn = spktrn[indices]
+                speed_mask = np.where(spk_spd >= speed_thresh)[0]
+                spk_x = spk_x[speed_mask]
+                spktrn = spktrn[speed_mask]
+            
+            # --- FIX 3: Strict filtering of NaNs and out-of-bounds values ---
+            valid_mask = ~np.isnan(spk_x) & (spk_x >= xbin[0]) & (spk_x <= xbin[-1])
+            spk_x = spk_x[valid_mask]
+            spktrn = spktrn[valid_mask]
             
             spk_pos.append(spk_x)
             spk_t.append(spktrn)
             spkcounts.append(np.histogram(spk_x, bins=xbin)[0])
         
-        # Calculate firing rate maps
-        spkcounts = smooth_(np.asarray(spkcounts))
-        occupancy = np.histogram(x_thresh, bins=xbin)[0] / position_srate + 1e-16
-        occupancy = smooth_(occupancy)
-        tuning_curve = spkcounts / occupancy.reshape(1, -1)
+        # --- FIX 4 & 5: Robust firing rate map calculation with Occupancy Masking ---
+        spkcounts = smooth_(np.asarray(spkcounts, dtype=float))
+        
+        # Calculate raw occupancy WITHOUT the 1e-16 hack
+        raw_occupancy = np.histogram(x_thresh, bins=xbin)[0] / position_srate
+        occupancy = smooth_(np.asarray(raw_occupancy, dtype=float))
+        
+        # Initialize tuning curve with zeros
+        tuning_curve = np.zeros_like(spkcounts, dtype=float)
+        
+        # Create an occupancy mask (e.g., minimum 0.001 seconds spent in a bin to be considered valid)
+        min_occ_thresh = 0.001
+        valid_bins = occupancy > min_occ_thresh
+        
+        # Only compute firing rate for valid, visited bins
+        tuning_curve[:, valid_bins] = spkcounts[:, valid_bins] / occupancy[valid_bins]
         
         # Filter by peak firing rate threshold
         frate_thresh_indx = np.where(np.max(tuning_curve, axis=1) >= frate_thresh)[0]

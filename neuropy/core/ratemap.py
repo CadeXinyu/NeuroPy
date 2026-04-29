@@ -287,7 +287,7 @@ class Ratemap(DataWriter):
     @staticmethod
     def _circular_gaussian_smooth(tuning, sigma, truncate=4.0):
         """
-        Smooth 1D circular tuning curves with Gaussian kernel using edge wrapping.
+        Smooth 1D circular tuning curves with Gaussian kernel using SciPy's built-in wrap mode.
         
         Parameters
         ----------
@@ -297,26 +297,10 @@ class Ratemap(DataWriter):
         truncate : float, default 4.0
             Truncate filter at this many sigmas (matches scipy default)
         """
-        n_neurons, n_pos = tuning.shape
+        from scipy.ndimage import gaussian_filter1d
         
-        # Pad must cover full filter extent
-        pad_width = int(np.ceil(truncate * sigma))
-        
-        # Handle case where pad_width >= n_pos (very large sigma)
-        if pad_width >= n_pos:
-            # Just tile the whole array
-            tuning_padded = np.tile(tuning, (1, 3))
-            smoothed_padded = gaussian_filter1d(tuning_padded, sigma=sigma, axis=1, truncate=truncate)
-            return smoothed_padded[:, n_pos:2*n_pos]
-        
-        tuning_padded = np.concatenate([
-            tuning[:, -pad_width:],
-            tuning,
-            tuning[:, :pad_width]
-        ], axis=1)
-        
-        smoothed_padded = gaussian_filter1d(tuning_padded, sigma=sigma, axis=1, truncate=truncate)
-        return smoothed_padded[:, pad_width:-pad_width]
+        # mode='wrap' exactly implements circular boundary conditions
+        return gaussian_filter1d(tuning, sigma=sigma, axis=1, mode='wrap', truncate=truncate)
     
     def smooth_tuning_curves(self, sigma_bin, mode='linear'):
         """
