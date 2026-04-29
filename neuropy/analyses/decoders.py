@@ -77,6 +77,11 @@ def crop_posterior(posterior, window_fraction=0.33):
         return posterior[wrapped_indices, :]
 
 class Decode1d:
+
+    # ==========================================================
+    # BLOCK 1: Initialization & Main Pipeline
+    # ==========================================================
+
     def __init__(
         self,
         neurons: core.Neurons,
@@ -116,7 +121,7 @@ class Decode1d:
         decoder_mode : str, optional
             Decoding backend to use for final posterior. Options: 'bayesian' or 'hmm', by default 'bayesian'.
         hmm_params : dict, optional
-            Optional kwargs passed to apply_2state_hmm_filter when decoder_mode='hmm'.
+            Optional kwargs passed to decode_with_2state_hmm when decoder_mode='hmm'.
         """
         # Store decode configuration and initialize outputs/containers.
         self.ratemap = ratemap
@@ -144,490 +149,6 @@ class Decode1d:
             raise ValueError("decoder_mode must be 'bayesian', 'hmm', or 'DD'")
 
         self._estimate()
-
-    def decode_cpu(self, spkcount, tuning_curves, return_likelihood=False):
-        """
-        Bayesian decoding (CPU version) that handles both 1D and directional (2D) tuning curves.
-        
-        Parameters
-        ----------
-        spkcount : np.ndarray
-            Shape (n_neurons, n_time_bins). Spike counts per bin.
-        tuning_curves : np.ndarray
-            Shape (n_neurons, n_spatial_bins) OR (n_neurons, n_spatial_bins, n_directions).
-        return_likelihood : bool, optional
-            If True, also return unnormalized likelihoods before posterior normalization.
-
-        Returns
-        -------
-        posterior : np.ndarray
-            If directional: Shape (n_spatial_bins, n_time_bins, 2).
-            If non-directional: Shape (n_spatial_bins, n_time_bins).
-        """
-        # Compute Bayesian posterior on CPU and optionally expose raw likelihoods.
-        
-        # ---------------------------------------------------------
-        # PART 1: Pre-processing 
-        # Flatten directional dimensions if necessary
-        # ---------------------------------------------------------
-        if tuning_curves.ndim == 3 and tuning_curves.shape[2] > 1:
-            n_neurons, n_bins, n_dirs = tuning_curves.shape
-            
-            # Transpose to (Neurons, Dirs, Bins) -> Reshape to (Neurons, Total_Bins)
-            # This ensures the first n_bins columns are Dir0, next n_bins are Dir1
-            ratemaps = tuning_curves.transpose(0, 2, 1).reshape(n_neurons, -1)
-            is_directional = True
-        else:
-            ratemaps = tuning_curves
-            n_bins = tuning_curves.shape[1]
-            is_directional = False
-
-        # ---------------------------------------------------------
-        # PART 2: Core Decoding
-        # Formula: prob = (product(rates^spikes)) * exp(-tau * sum(rates))
-        # ---------------------------------------------------------
-        n_positions = ratemaps.shape[1]
-        n_time_bins = spkcount.shape[1]
-        likelihood = np.zeros((n_positions, n_time_bins))
-
-        for i in range(n_positions):
-            # Ignore neurons/indx which have zero frate at this location 
-            # to avoid having frate product zero
-            valid_indx = ratemaps[:, i] > 0
-            
-            if np.any(valid_indx):
-                # (Rate ^ k)
-                # Use newaxis to broadcast rates across time bins
-                frate = (ratemaps[valid_indx, i, np.newaxis]) ** spkcount[valid_indx, :]
-                
-                # exp(-tau * sum(Rate))
-                # The sum is over neurons for this specific position 'i'
-                exp_frate = np.exp(-self.time_bin_size * np.sum(ratemaps[valid_indx, i]))
-                
-                # Combine: Product over neurons * Exponential term
-                likelihood[i, :] = np.prod(frate, axis=0) * exp_frate
-
-        # ---------------------------------------------------------
-        # PART 3: Normalization
-        # ---------------------------------------------------------
-        old_settings = np.seterr(all="ignore")
-
-        prob = likelihood.copy()
-        
-        # Normalize across positions so sum(prob) = 1 for each time bin
-        prob_sum = np.sum(prob, axis=0, keepdims=True)
-        # Avoid division by zero
-        prob /= prob_sum
-        
-        np.seterr(**old_settings)
-        
-        # Handle NaNs that might result from 0/0 division
-        prob = np.nan_to_num(prob)
-
-        # ---------------------------------------------------------
-        # PART 4: Reshaping
-        # ---------------------------------------------------------
-        if is_directional:
-            # raw_posterior is (2*n_bins, n_time)
-            # Split into the two direction blocks based on how we stacked them in Part 1
-            block0 = prob[:n_bins, :] # Direction 0
-            block1 = prob[n_bins:, :] # Direction 1
-
-            block0_like = likelihood[:n_bins, :]
-            block1_like = likelihood[n_bins:, :]
-
-            # Stack along a new 3rd dimension: (n_bins, n_time, 2)
-            final_posterior = np.stack([block0, block1], axis=2)
-            final_likelihood = np.stack([block0_like, block1_like], axis=2)
-            if return_likelihood:
-                return final_posterior, final_likelihood
-            return final_posterior
-        else:
-            # Non-directional: Return as is (n_bins, n_time)
-            if return_likelihood:
-                return prob, likelihood
-            return prob
-
-    def _build_spatial_transition_matrices(self, n_bins, dt, dx, v=0.0, sigma=0.0):
-        """Build 3-state spatial transition matrices.
-
-        Unified builder for both the legacy 2-state HMM and the 3-state
-        Switching HMM (Wu & Wei 2025).  The Gaussian kernel width is
-        always ``sigma * sqrt(dt) / dx`` (Fokker-Planck formulation).
-
-        Special cases
-        -------------
-        * ``v=0, sigma>0`` → symmetric Gaussian (pure diffusion).
-        * ``v=0, sigma=0`` → identity matrix   (stationary).
-        * ``v≠0, sigma>0`` → asymmetric Gaussian (drift-diffusion).
-
-        States
-        ------
-        0 - Stationary : Identity matrix (position stays the same).
-        1 - Fragmented : Uniform distribution (position jumps anywhere).
-        2 - Drift-Diffusion : Gaussian kernel with drift *v* and diffusion *sigma*.
-
-        Parameters
-        ----------
-        n_bins : int
-            Number of spatial bins.
-        dt : float
-            Time step duration (seconds).
-        dx : float
-            Spatial bin width (same units as *v* and *sigma*).
-        v : float, optional
-            Drift velocity (position units per second).  Default 0.
-        sigma : float, optional
-            Diffusion coefficient (position units per √s).  Default 0.
-
-        Returns
-        -------
-        np.ndarray
-            Shape ``(3, n_bins, n_bins)`` where ``matrix[s, i, j]`` is
-            *p(x_t = i | x_{t-1} = j, state = s)*.  Every matrix is
-            strictly column-normalized.
-        """
-        # --- State 0: Stationary (identity) ---
-        mat_stat = np.eye(n_bins, dtype=np.float64)
-
-        # --- State 1: Fragmented (uniform) ---
-        mat_frag = np.full((n_bins, n_bins), 1.0 / n_bins, dtype=np.float64)
-
-        # --- State 2: Drift-Diffusion ---
-        # Signed distance grid: dist[i, j] = pos_to(i) - pos_from(j)
-        pos = np.arange(n_bins, dtype=np.float64)
-        dist = pos[:, None] - pos[None, :]          # (n_bins, n_bins)
-
-        if self.mode == "circular":
-            # Wrap to [-n_bins/2, n_bins/2) for directional circular distance
-            dist = (dist + n_bins / 2) % n_bins - n_bins / 2
-
-        # Drift and diffusion in bin units
-        mu = v * dt / dx                             # mean shift  (bins)
-        s = sigma * np.sqrt(dt) / dx + 1e-6          # std dev     (bins)
-
-        # Fokker-Planck fundamental solution
-        mat_dd = np.exp(-0.5 * ((dist - mu) / s) ** 2)
-
-        # --- Column normalization (all three matrices) ---
-        for mat in [mat_stat, mat_frag, mat_dd]:
-            col_sums = np.sum(mat, axis=0, keepdims=True)
-            mat[:] = mat / np.maximum(col_sums, 1e-12)
-
-        return np.stack([mat_stat, mat_frag, mat_dd], axis=0)
-
-    def _run_switching_hmm_forward(self, likelihood, trans_state, trans_space):
-        """Forward pass of the 3-state Switching HMM.
-
-        Parameters
-        ----------
-        likelihood : np.ndarray
-            Neural likelihood p(spikes_t | x_t), shape ``(n_bins, n_time)``.
-        trans_state : np.ndarray
-            Discrete state transition matrix p(I_t | I_{t-1}),
-            shape ``(3, 3)``, column-normalized.
-        trans_space : np.ndarray
-            Per-state spatial transition matrices from
-            :meth:`_build_switching_spatial_matrices`,
-            shape ``(3, n_bins, n_bins)``.
-
-        Returns
-        -------
-        causal_joint : np.ndarray
-            Filtered joint posterior p(x_t, I_t | y_{1:t}),
-            shape ``(3, n_bins, n_time)``.
-        data_log_likelihood : float
-            Accumulated log-likelihood log p(y_{1:T}).
-        """
-        if likelihood.ndim == 3:
-            likelihood = np.sum(likelihood, axis=2)
-
-        likelihood = np.asarray(likelihood, dtype=np.float64)
-        likelihood = np.clip(likelihood, 1e-300, None)
-
-        n_bins, n_time = likelihood.shape
-        n_states = 3
-
-        causal_joint = np.zeros((n_states, n_bins, n_time), dtype=np.float64)
-        joint_prev = np.full((n_states, n_bins), 1.0 / (n_states * n_bins),
-                             dtype=np.float64)
-
-        data_log_likelihood = 0.0
-
-        for t in range(n_time):
-            # Step A: State transition
-            mixed = trans_state @ joint_prev                    # (3, n_bins)
-
-            # Step B: Spatial transition per state
-            pred = np.zeros_like(joint_prev)                    # (3, n_bins)
-            for s in range(n_states):
-                pred[s] = trans_space[s] @ mixed[s]             # (n_bins,)
-
-            # Step C: Observation update
-            updated = pred * likelihood[:, t][None, :]          # (3, n_bins)
-
-            # Step D: Normalize & accumulate log-likelihood
-            norm = np.sum(updated)
-            if norm <= 0 or not np.isfinite(norm):
-                updated = np.full_like(updated, 1.0 / (n_states * n_bins))
-            else:
-                data_log_likelihood += np.log(norm)
-                updated = updated / norm
-
-            causal_joint[:, :, t] = updated
-            joint_prev = updated
-
-        return causal_joint, data_log_likelihood
-
-    def _run_switching_hmm_smoother(self, causal_joint, trans_state, trans_space):
-        """Backward smoother for the 3-state Switching HMM.
-
-        Refines the causal (forward-only) posterior into the acausal
-        (full-sequence) posterior using the standard HMM backward
-        smoothing recursion.
-
-        Parameters
-        ----------
-        causal_joint : np.ndarray
-            Output of :meth:`_run_switching_hmm_forward`,
-            shape ``(3, n_bins, n_time)``.
-        trans_state : np.ndarray
-            Discrete state transition matrix, shape ``(3, 3)``,
-            column-normalized.
-        trans_space : np.ndarray
-            Per-state spatial transition matrices,
-            shape ``(3, n_bins, n_bins)``.
-
-        Returns
-        -------
-        acausal_joint : np.ndarray
-            Smoothed joint posterior p(x_t, I_t | y_{1:T}),
-            shape ``(3, n_bins, n_time)``.
-        """
-        n_states, n_bins, n_time = causal_joint.shape
-        acausal_joint = np.zeros_like(causal_joint)
-
-        # Last time step: smoothed == causal
-        acausal_joint[:, :, -1] = causal_joint[:, :, -1]
-
-        for t in range(n_time - 2, -1, -1):
-            # Replicate forward prediction at t+1
-            # Step A: State transition from causal at t
-            mixed = trans_state @ causal_joint[:, :, t]         # (3, n_bins)
-            # Step B: Spatial transition per state
-            prior = np.zeros((n_states, n_bins), dtype=np.float64)
-            for s in range(n_states):
-                prior[s] = trans_space[s] @ mixed[s]
-
-            # Ratio of smoothed to predicted at t+1
-            ratio = acausal_joint[:, :, t + 1] / (prior + 1e-15)  # (3, n_bins)
-
-            # Backward weights
-            weights = np.zeros((n_states, n_bins), dtype=np.float64)
-            for s in range(n_states):
-                for s_next in range(n_states):
-                    # trans_space[s_next] is (n_bins, n_bins) with [to, from],
-                    # transpose to project backwards: from -> to
-                    weights[s] += trans_state[s_next, s] * (
-                        trans_space[s_next].T @ ratio[s_next]
-                    )
-
-            acausal_joint[:, :, t] = weights * causal_joint[:, :, t]
-
-            # Normalize
-            norm = np.sum(acausal_joint[:, :, t])
-            if norm > 0 and np.isfinite(norm):
-                acausal_joint[:, :, t] /= norm
-            else:
-                acausal_joint[:, :, t] = 1.0 / (n_states * n_bins)
-
-        return acausal_joint
-
-    def _optimize_epoch_params(self, seq_likelihood, dt, trans_state):
-        """Find optimal drift and diffusion for a single replay event.
-
-        Maximises the data log-likelihood from the 3-state Switching HMM
-        forward pass over the drift velocity *v* and diffusion coefficient
-        *sigma* using L-BFGS-B.
-
-        Parameters
-        ----------
-        seq_likelihood : np.ndarray
-            Neural likelihood for one event, shape ``(n_bins, n_time)``.
-        dt : float
-            Time bin size (seconds).
-        trans_state : np.ndarray
-            Initial discrete state transition matrix, shape ``(3, 3)``.
-            Used only as a template; ``stay_prob`` is fitted jointly.
-
-        Returns
-        -------
-        opt_stay : float
-            Optimal state-level stay probability.
-        opt_v : float
-            Optimal drift velocity (position units / s).
-        opt_sigma : float
-            Optimal diffusion coefficient (position units / √s).
-        max_log_likelihood : float
-            Maximised log p(y_{1:T}).
-        acausal_joint : np.ndarray
-            Smoothed joint posterior, shape ``(3, n_bins, n_time)``.
-        """
-        from scipy.optimize import minimize
-
-        seq_likelihood = np.asarray(seq_likelihood, dtype=np.float64)
-        if seq_likelihood.ndim == 3:
-            seq_likelihood = np.sum(seq_likelihood, axis=2)
-        seq_likelihood = np.clip(seq_likelihood, 1e-300, None)
-
-        n_bins = seq_likelihood.shape[0]
-        dx = self.pos_bin_size
-
-        # ------ objective (negative log-likelihood) ------
-        def neg_loglik(params):
-            stay_prob, v, sigma = params
-            switch_prob = (1.0 - stay_prob) / 2.0
-            current_trans_state = np.full((3, 3), switch_prob, dtype=np.float64)
-            np.fill_diagonal(current_trans_state, stay_prob)
-            trans_space = self._build_spatial_transition_matrices(
-                n_bins, dt=dt, dx=dx, v=v, sigma=sigma,
-            )
-            _, data_ll = self._run_switching_hmm_forward(
-                seq_likelihood, current_trans_state, trans_space,
-            )
-            return -data_ll
-
-        # ------ optimise ------
-        bounds = [(0.50, 0.99), (-1500.0, 1500.0), (5.0, 50.0)]
-        initial_guess = [0.98, 0.0, 20.0]
-        result = minimize(
-            neg_loglik, initial_guess, bounds=bounds, method='L-BFGS-B',
-        )
-
-        opt_stay, opt_v, opt_sigma = result.x
-
-        # ------ final inference with optimal params ------
-        switch_prob = (1.0 - opt_stay) / 2.0
-        opt_trans_state = np.full((3, 3), switch_prob, dtype=np.float64)
-        np.fill_diagonal(opt_trans_state, opt_stay)
-
-        trans_space = self._build_spatial_transition_matrices(
-            n_bins, dt=dt, dx=dx, v=opt_v, sigma=opt_sigma,
-        )
-        causal_joint, _ = self._run_switching_hmm_forward(
-            seq_likelihood, opt_trans_state, trans_space,
-        )
-        acausal_joint = self._run_switching_hmm_smoother(
-            causal_joint, opt_trans_state, trans_space,
-        )
-
-        max_log_likelihood = -result.fun
-        return opt_stay, opt_v, opt_sigma, max_log_likelihood, acausal_joint
-
-    def _run_hmm_filter_array(self, likelihood, trans_state, trans_space):
-        """Forward filter on CPU (NumPy)."""
-        # Run recursive HMM forward pass using NumPy arrays.
-        if likelihood.ndim == 3:
-            likelihood = np.sum(likelihood, axis=2)
-
-        likelihood = np.asarray(likelihood, dtype=np.float64)
-        likelihood = np.clip(likelihood, 1e-300, None)
-
-        n_bins, n_time = likelihood.shape
-        n_states = 2
-
-        joint = np.zeros((n_states, n_bins, n_time), dtype=np.float64)
-        joint_prev = np.full((n_states, n_bins), 1.0 / (n_states * n_bins), dtype=np.float64)
-
-        for t in range(n_time):
-            mixed = trans_state @ joint_prev
-            pred = np.zeros_like(joint_prev)
-            for s in range(n_states):
-                pred[s] = trans_space[s] @ mixed[s]
-
-            updated = pred * likelihood[:, t][None, :]
-            norm = np.sum(updated)
-            if norm <= 0 or not np.isfinite(norm):
-                updated = np.full_like(updated, 1.0 / (n_states * n_bins))
-            else:
-                updated = updated / norm
-
-            joint[:, :, t] = updated
-            joint_prev = updated
-
-        state_prob = np.sum(joint, axis=1)
-        return joint, state_prob
-
-    def apply_2state_hmm_filter(
-        self,
-        likelihood=None,
-        stay_prob=0.98,
-        continuous_sigma=0.05,
-    ):
-        """Apply 2-state HMM forward filter to classify Continuous/Fragmented dynamics.
-
-        Parameters
-        ----------
-        likelihood : np.ndarray or torch.Tensor or list, optional
-            Neural likelihood p(spikes_t | x_t), shape (n_bins, n_time) or (n_bins, n_time, n_dirs).
-            If None, uses self.likelihood_raw computed during decoding.
-        stay_prob : float, optional
-            Probability of remaining in the same state.  The switching
-            probability is ``1 - stay_prob``.
-        continuous_sigma : float, optional
-            Spatial transition sigma in position units (e.g. radians) for
-            the Continuous state.  Internally converted to bins.
-        """
-        if likelihood is None:
-            if self.likelihood_raw is None:
-                raise ValueError("No likelihood provided and self.likelihood_raw is empty.")
-            likelihood = self.likelihood_raw
-
-        # 2-state transition matrix: switch_prob = 1 - stay_prob
-        switch_prob = 1.0 - stay_prob
-        trans_state = np.array(
-            [[stay_prob, switch_prob],
-             [switch_prob, stay_prob]], dtype=np.float64,
-        )
-        trans_state /= np.maximum(
-            np.sum(trans_state, axis=0, keepdims=True), 1e-12
-        )
-
-        def _single_sequence(seq_likelihood):
-            if isinstance(seq_likelihood, torch.Tensor):
-                n_bins = seq_likelihood.shape[0]
-            else:
-                n_bins = np.asarray(seq_likelihood).shape[0]
-
-            trans_space_3 = self._build_spatial_transition_matrices(
-                n_bins, dt=self.time_bin_size, dx=self.pos_bin_size,
-                v=0.0, sigma=continuous_sigma,
-            )
-            # 2-state: [Continuous(=DD with v=0), Fragmented]
-            trans_space = trans_space_3[[2, 1]]
-
-            if isinstance(seq_likelihood, torch.Tensor):
-                seq_np = seq_likelihood.detach().cpu().numpy()
-            else:
-                seq_np = np.asarray(seq_likelihood)
-
-            return self._run_hmm_filter_array(seq_np, trans_state, trans_space)
-
-        if isinstance(likelihood, list):
-            joint_list = []
-            state_list = []
-            for seq_like in likelihood:
-                joint_i, state_i = _single_sequence(seq_like)
-                joint_list.append(joint_i)
-                state_list.append(state_i)
-            self.hmm_joint_posterior = joint_list
-            self.hmm_state_probability = state_list
-        else:
-            joint, state_prob = _single_sequence(likelihood)
-            self.hmm_joint_posterior = joint
-            self.hmm_state_probability = state_prob
-
-        return self.hmm_joint_posterior, self.hmm_state_probability
 
     def _estimate(self):
         """Estimates position with Position-wise Directional Reduction"""
@@ -660,7 +181,7 @@ class Decode1d:
             self.n_spikes = np.sum(stacked_spkcount)
 
         # --- Call Helper Function ---
-        raw_posterior, raw_likelihood = self.decode_cpu(
+        raw_posterior, raw_likelihood = self._compute_memoryless_bayesian(
             stacked_spkcount, tuning_curves, return_likelihood=True
         )
 
@@ -687,7 +208,7 @@ class Decode1d:
 
         # Optional HMM backend: replace marginal posterior with HMM-filtered posterior
         if self.decoder_mode == 'hmm':
-            self.hmm_joint_posterior, self.hmm_state_probability = self.apply_2state_hmm_filter(
+            self.hmm_joint_posterior, self.hmm_state_probability = self.decode_with_2state_hmm(
                 likelihood=likelihoods_to_run,
                 **self.hmm_params,
             )
@@ -716,7 +237,7 @@ class Decode1d:
                     opt_sig_list.append(np.nan); max_ll_list.append(np.nan)
                     continue
 
-                opt_stay, opt_v, opt_sig, max_ll, acausal_joint = self._optimize_epoch_params(seq_like, self.time_bin_size, trans_state)
+                opt_stay, opt_v, opt_sig, max_ll, acausal_joint = self.decode_with_3state_dd_optimizer(seq_like, self.time_bin_size, trans_state)
                 spatial_post_list.append(np.sum(acausal_joint, axis=0))
                 joint_list.append(acausal_joint)
                 state_prob_list.append(np.sum(acausal_joint, axis=1))
@@ -805,6 +326,511 @@ class Decode1d:
             n = marginal_posterior.shape[1]
             slideby = self.time_bin_size if self.slideby is None else self.slideby
             self.decoded_time = t_start + np.arange(n)*slideby + self.time_bin_size/2
+
+    # ==========================================================
+    # BLOCK 2: Step 1 - Classical Bayesian Inference
+    # ==========================================================
+
+    def _compute_memoryless_bayesian(self, spkcount, tuning_curves, return_likelihood=False):
+        """Classical memoryless Bayesian decoding based purely on Poisson spiking
+        probability (no temporal priors).
+
+        Handles both 1D and directional (2D) tuning curves.
+        
+        Parameters
+        ----------
+        spkcount : np.ndarray
+            Shape (n_neurons, n_time_bins). Spike counts per bin.
+        tuning_curves : np.ndarray
+            Shape (n_neurons, n_spatial_bins) OR (n_neurons, n_spatial_bins, n_directions).
+        return_likelihood : bool, optional
+            If True, also return unnormalized likelihoods before posterior normalization.
+
+        Returns
+        -------
+        posterior : np.ndarray
+            If directional: Shape (n_spatial_bins, n_time_bins, 2).
+            If non-directional: Shape (n_spatial_bins, n_time_bins).
+        """
+        
+        # ---------------------------------------------------------
+        # PART 1: Pre-processing 
+        # Flatten directional dimensions if necessary
+        # ---------------------------------------------------------
+        if tuning_curves.ndim == 3 and tuning_curves.shape[2] > 1:
+            n_neurons, n_bins, n_dirs = tuning_curves.shape
+            
+            # Transpose to (Neurons, Dirs, Bins) -> Reshape to (Neurons, Total_Bins)
+            # This ensures the first n_bins columns are Dir0, next n_bins are Dir1
+            ratemaps = tuning_curves.transpose(0, 2, 1).reshape(n_neurons, -1)
+            is_directional = True
+        else:
+            ratemaps = tuning_curves
+            n_bins = tuning_curves.shape[1]
+            is_directional = False
+
+        # ---------------------------------------------------------
+        # PART 2: Core Decoding
+        # Formula: prob = (product(rates^spikes)) * exp(-tau * sum(rates))
+        # ---------------------------------------------------------
+        n_positions = ratemaps.shape[1]
+        n_time_bins = spkcount.shape[1]
+        likelihood = np.zeros((n_positions, n_time_bins))
+
+        for i in range(n_positions):
+            # Ignore neurons/indx which have zero frate at this location 
+            # to avoid having frate product zero
+            valid_indx = ratemaps[:, i] > 0
+            
+            if np.any(valid_indx):
+                # (Rate ^ k)
+                # Use newaxis to broadcast rates across time bins
+                frate = (ratemaps[valid_indx, i, np.newaxis]) ** spkcount[valid_indx, :]
+                
+                # exp(-tau * sum(Rate))
+                # The sum is over neurons for this specific position 'i'
+                exp_frate = np.exp(-self.time_bin_size * np.sum(ratemaps[valid_indx, i]))
+                
+                # Combine: Product over neurons * Exponential term
+                likelihood[i, :] = np.prod(frate, axis=0) * exp_frate
+
+        # ---------------------------------------------------------
+        # PART 3: Normalization
+        # ---------------------------------------------------------
+        old_settings = np.seterr(all="ignore")
+
+        prob = likelihood.copy()
+        
+        # Normalize across positions so sum(prob) = 1 for each time bin
+        prob_sum = np.sum(prob, axis=0, keepdims=True)
+        # Avoid division by zero
+        prob /= prob_sum
+        
+        np.seterr(**old_settings)
+        
+        # Handle NaNs that might result from 0/0 division
+        prob = np.nan_to_num(prob)
+
+        # ---------------------------------------------------------
+        # PART 4: Reshaping
+        # ---------------------------------------------------------
+        if is_directional:
+            # raw_posterior is (2*n_bins, n_time)
+            # Split into the two direction blocks based on how we stacked them in Part 1
+            block0 = prob[:n_bins, :] # Direction 0
+            block1 = prob[n_bins:, :] # Direction 1
+
+            block0_like = likelihood[:n_bins, :]
+            block1_like = likelihood[n_bins:, :]
+
+            # Stack along a new 3rd dimension: (n_bins, n_time, 2)
+            final_posterior = np.stack([block0, block1], axis=2)
+            final_likelihood = np.stack([block0_like, block1_like], axis=2)
+            if return_likelihood:
+                return final_posterior, final_likelihood
+            return final_posterior
+        else:
+            # Non-directional: Return as is (n_bins, n_time)
+            if return_likelihood:
+                return prob, likelihood
+            return prob
+
+    # ==========================================================
+    # BLOCK 3: Step 2 - HMM Math Engines
+    # ==========================================================
+
+    def _build_spatial_transition_matrices(self, n_bins, dt, dx, v=0.0, sigma=0.0):
+        """Build 3-state spatial transition matrices.
+
+        Unified builder for both the legacy 2-state HMM and the 3-state
+        Switching HMM (Wu & Wei 2025).  The Gaussian kernel width is
+        always ``sigma * sqrt(dt) / dx`` (Fokker-Planck formulation).
+
+        Special cases
+        -------------
+        * ``v=0, sigma>0`` → symmetric Gaussian (pure diffusion).
+        * ``v=0, sigma=0`` → identity matrix   (stationary).
+        * ``v≠0, sigma>0`` → asymmetric Gaussian (drift-diffusion).
+
+        States
+        ------
+        0 - Stationary : Identity matrix (position stays the same).
+        1 - Fragmented : Uniform distribution (position jumps anywhere).
+        2 - Drift-Diffusion : Gaussian kernel with drift *v* and diffusion *sigma*.
+
+        Parameters
+        ----------
+        n_bins : int
+            Number of spatial bins.
+        dt : float
+            Time step duration (seconds).
+        dx : float
+            Spatial bin width (same units as *v* and *sigma*).
+        v : float, optional
+            Drift velocity (position units per second).  Default 0.
+        sigma : float, optional
+            Diffusion coefficient (position units per √s).  Default 0.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(3, n_bins, n_bins)`` where ``matrix[s, i, j]`` is
+            *p(x_t = i | x_{t-1} = j, state = s)*.  Every matrix is
+            strictly column-normalized.
+        """
+        # --- State 0: Stationary (identity) ---
+        mat_stat = np.eye(n_bins, dtype=np.float64)
+
+        # --- State 1: Fragmented (uniform) ---
+        mat_frag = np.full((n_bins, n_bins), 1.0 / n_bins, dtype=np.float64)
+
+        # --- State 2: Drift-Diffusion ---
+        # Signed distance grid: dist[i, j] = pos_to(i) - pos_from(j)
+        pos = np.arange(n_bins, dtype=np.float64)
+        dist = pos[:, None] - pos[None, :]          # (n_bins, n_bins)
+
+        if self.mode == "circular":
+            # Wrap to [-n_bins/2, n_bins/2) for directional circular distance
+            dist = (dist + n_bins / 2) % n_bins - n_bins / 2
+
+        # Drift and diffusion in bin units
+        mu = v * dt / dx                             # mean shift  (bins)
+        s = sigma * np.sqrt(dt) / dx + 1e-6          # std dev     (bins)
+
+        # Fokker-Planck fundamental solution
+        mat_dd = np.exp(-0.5 * ((dist - mu) / s) ** 2)
+
+        # --- Column normalization (all three matrices) ---
+        for mat in [mat_stat, mat_frag, mat_dd]:
+            col_sums = np.sum(mat, axis=0, keepdims=True)
+            mat[:] = mat / np.maximum(col_sums, 1e-12)
+
+        return np.stack([mat_stat, mat_frag, mat_dd], axis=0)
+
+    def _hmm_forward_filter(self, likelihood, trans_state, trans_space):
+        """Causal forward filter.  Calculates posterior up to time *t* using
+        history, and returns data log-likelihood.
+
+        Works for any number of states (2 or 3).
+
+        Parameters
+        ----------
+        likelihood : np.ndarray
+            Neural likelihood p(spikes_t | x_t), shape ``(n_bins, n_time)``.
+        trans_state : np.ndarray
+            Discrete state transition matrix p(I_t | I_{t-1}),
+            shape ``(n_states, n_states)``, column-normalized.
+        trans_space : np.ndarray
+            Per-state spatial transition matrices,
+            shape ``(n_states, n_bins, n_bins)``.
+
+        Returns
+        -------
+        causal_joint : np.ndarray
+            Filtered joint posterior p(x_t, I_t | y_{1:t}),
+            shape ``(n_states, n_bins, n_time)``.
+        data_log_likelihood : float
+            Accumulated log-likelihood log p(y_{1:T}).
+        """
+        if likelihood.ndim == 3:
+            likelihood = np.sum(likelihood, axis=2)
+
+        likelihood = np.asarray(likelihood, dtype=np.float64)
+        likelihood = np.clip(likelihood, 1e-300, None)
+
+        n_bins, n_time = likelihood.shape
+        n_states = 3
+
+        causal_joint = np.zeros((n_states, n_bins, n_time), dtype=np.float64)
+        joint_prev = np.full((n_states, n_bins), 1.0 / (n_states * n_bins),
+                             dtype=np.float64)
+
+        data_log_likelihood = 0.0
+
+        for t in range(n_time):
+            # Step A: State transition
+            mixed = trans_state @ joint_prev                    # (3, n_bins)
+
+            # Step B: Spatial transition per state
+            pred = np.zeros_like(joint_prev)                    # (3, n_bins)
+            for s in range(n_states):
+                pred[s] = trans_space[s] @ mixed[s]             # (n_bins,)
+
+            # Step C: Observation update
+            updated = pred * likelihood[:, t][None, :]          # (3, n_bins)
+
+            # Step D: Normalize & accumulate log-likelihood
+            norm = np.sum(updated)
+            if norm <= 0 or not np.isfinite(norm):
+                updated = np.full_like(updated, 1.0 / (n_states * n_bins))
+            else:
+                data_log_likelihood += np.log(norm)
+                updated = updated / norm
+
+            causal_joint[:, :, t] = updated
+            joint_prev = updated
+
+        return causal_joint, data_log_likelihood
+
+    def _hmm_backward_smoother(self, causal_joint, trans_state, trans_space):
+        """Acausal backward smoother.  Uses complete sequence (future info)
+        to correct the causal posterior and eliminate lag.
+
+        Works for any number of states (2 or 3).
+
+        Parameters
+        ----------
+        causal_joint : np.ndarray
+            Output of the forward filter,
+            shape ``(n_states, n_bins, n_time)``.
+        trans_state : np.ndarray
+            Discrete state transition matrix, shape ``(n_states, n_states)``,
+            column-normalized.
+        trans_space : np.ndarray
+            Per-state spatial transition matrices,
+            shape ``(n_states, n_bins, n_bins)``.
+
+        Returns
+        -------
+        acausal_joint : np.ndarray
+            Smoothed joint posterior p(x_t, I_t | y_{1:T}),
+            shape ``(n_states, n_bins, n_time)``.
+        """
+        n_states, n_bins, n_time = causal_joint.shape
+        acausal_joint = np.zeros_like(causal_joint)
+
+        # Last time step: smoothed == causal
+        acausal_joint[:, :, -1] = causal_joint[:, :, -1]
+
+        for t in range(n_time - 2, -1, -1):
+            # Replicate forward prediction at t+1
+            # Step A: State transition from causal at t
+            mixed = trans_state @ causal_joint[:, :, t]         # (3, n_bins)
+            # Step B: Spatial transition per state
+            prior = np.zeros((n_states, n_bins), dtype=np.float64)
+            for s in range(n_states):
+                prior[s] = trans_space[s] @ mixed[s]
+
+            # Ratio of smoothed to predicted at t+1
+            ratio = acausal_joint[:, :, t + 1] / (prior + 1e-15)  # (3, n_bins)
+
+            # Backward weights
+            weights = np.zeros((n_states, n_bins), dtype=np.float64)
+            for s in range(n_states):
+                for s_next in range(n_states):
+                    # trans_space[s_next] is (n_bins, n_bins) with [to, from],
+                    # transpose to project backwards: from -> to
+                    weights[s] += trans_state[s_next, s] * (
+                        trans_space[s_next].T @ ratio[s_next]
+                    )
+
+            acausal_joint[:, :, t] = weights * causal_joint[:, :, t]
+
+            # Normalize
+            norm = np.sum(acausal_joint[:, :, t])
+            if norm > 0 and np.isfinite(norm):
+                acausal_joint[:, :, t] /= norm
+            else:
+                acausal_joint[:, :, t] = 1.0 / (n_states * n_bins)
+
+        return acausal_joint
+
+    # ==========================================================
+    # BLOCK 4: Step 3 - Decoding Strategies
+    # ==========================================================
+
+    def decode_with_2state_hmm(
+        self,
+        likelihood=None,
+        stay_prob=0.98,
+        continuous_sigma=0.05,
+    ):
+        """Wrapper to run the legacy 2-state (Continuous vs Fragmented) HMM
+        on the entire sequence.
+
+        Parameters
+        ----------
+        likelihood : np.ndarray or torch.Tensor or list, optional
+            Neural likelihood p(spikes_t | x_t), shape (n_bins, n_time) or (n_bins, n_time, n_dirs).
+            If None, uses self.likelihood_raw computed during decoding.
+        stay_prob : float, optional
+            Probability of remaining in the same state.  The switching
+            probability is ``1 - stay_prob``.
+        continuous_sigma : float, optional
+            Spatial transition sigma in position units (e.g. radians) for
+            the Continuous state.  Internally converted to bins.
+        """
+        if likelihood is None:
+            if self.likelihood_raw is None:
+                raise ValueError("No likelihood provided and self.likelihood_raw is empty.")
+            likelihood = self.likelihood_raw
+
+        # 2-state transition matrix: switch_prob = 1 - stay_prob
+        switch_prob = 1.0 - stay_prob
+        trans_state = np.array(
+            [[stay_prob, switch_prob],
+             [switch_prob, stay_prob]], dtype=np.float64,
+        )
+        trans_state /= np.maximum(
+            np.sum(trans_state, axis=0, keepdims=True), 1e-12
+        )
+
+        def _single_sequence(seq_likelihood):
+            if isinstance(seq_likelihood, torch.Tensor):
+                n_bins = seq_likelihood.shape[0]
+            else:
+                n_bins = np.asarray(seq_likelihood).shape[0]
+
+            trans_space_3 = self._build_spatial_transition_matrices(
+                n_bins, dt=self.time_bin_size, dx=self.pos_bin_size,
+                v=0.0, sigma=continuous_sigma,
+            )
+            # 2-state: [Continuous(=DD with v=0), Fragmented]
+            trans_space = trans_space_3[[2, 1]]
+
+            if isinstance(seq_likelihood, torch.Tensor):
+                seq_np = seq_likelihood.detach().cpu().numpy()
+            else:
+                seq_np = np.asarray(seq_likelihood)
+
+            return self._run_2state_hmm_engine(seq_np, trans_state, trans_space)
+
+        if isinstance(likelihood, list):
+            joint_list = []
+            state_list = []
+            for seq_like in likelihood:
+                joint_i, state_i = _single_sequence(seq_like)
+                joint_list.append(joint_i)
+                state_list.append(state_i)
+            self.hmm_joint_posterior = joint_list
+            self.hmm_state_probability = state_list
+        else:
+            joint, state_prob = _single_sequence(likelihood)
+            self.hmm_joint_posterior = joint
+            self.hmm_state_probability = state_prob
+
+        return self.hmm_joint_posterior, self.hmm_state_probability
+
+    def _run_2state_hmm_engine(self, likelihood, trans_state, trans_space):
+        """Low-level 2-state HMM engine: forward filter + backward smoother."""
+        # Run recursive HMM forward pass using NumPy arrays.
+        if likelihood.ndim == 3:
+            likelihood = np.sum(likelihood, axis=2)
+
+        likelihood = np.asarray(likelihood, dtype=np.float64)
+        likelihood = np.clip(likelihood, 1e-300, None)
+
+        n_bins, n_time = likelihood.shape
+        n_states = 2
+
+        joint = np.zeros((n_states, n_bins, n_time), dtype=np.float64)
+        joint_prev = np.full((n_states, n_bins), 1.0 / (n_states * n_bins), dtype=np.float64)
+
+        for t in range(n_time):
+            mixed = trans_state @ joint_prev
+            pred = np.zeros_like(joint_prev)
+            for s in range(n_states):
+                pred[s] = trans_space[s] @ mixed[s]
+
+            updated = pred * likelihood[:, t][None, :]
+            norm = np.sum(updated)
+            if norm <= 0 or not np.isfinite(norm):
+                updated = np.full_like(updated, 1.0 / (n_states * n_bins))
+            else:
+                updated = updated / norm
+
+            joint[:, :, t] = updated
+            joint_prev = updated
+
+        # Backward smoother for acausal (full-sequence) posterior
+        acausal_joint = self._hmm_backward_smoother(joint, trans_state, trans_space)
+
+        state_prob = np.sum(acausal_joint, axis=1)
+        return acausal_joint, state_prob
+
+    def decode_with_3state_dd_optimizer(self, seq_likelihood, dt, trans_state):
+        """Wrapper to run the 3-state Drift-Diffusion Switching HMM.
+
+        Fits stay_prob, velocity (*v*) and diffusion (*sigma*) per event
+        by maximising the data log-likelihood via L-BFGS-B.
+
+        Parameters
+        ----------
+        seq_likelihood : np.ndarray
+            Neural likelihood for one event, shape ``(n_bins, n_time)``.
+        dt : float
+            Time bin size (seconds).
+        trans_state : np.ndarray
+            Initial discrete state transition matrix, shape ``(3, 3)``.
+            Used only as a template; ``stay_prob`` is fitted jointly.
+
+        Returns
+        -------
+        opt_stay : float
+            Optimal state-level stay probability.
+        opt_v : float
+            Optimal drift velocity (position units / s).
+        opt_sigma : float
+            Optimal diffusion coefficient (position units / √s).
+        max_log_likelihood : float
+            Maximised log p(y_{1:T}).
+        acausal_joint : np.ndarray
+            Smoothed joint posterior, shape ``(3, n_bins, n_time)``.
+        """
+        from scipy.optimize import minimize
+
+        seq_likelihood = np.asarray(seq_likelihood, dtype=np.float64)
+        if seq_likelihood.ndim == 3:
+            seq_likelihood = np.sum(seq_likelihood, axis=2)
+        seq_likelihood = np.clip(seq_likelihood, 1e-300, None)
+
+        n_bins = seq_likelihood.shape[0]
+        dx = self.pos_bin_size
+
+        # ------ objective (negative log-likelihood) ------
+        def neg_loglik(params):
+            stay_prob, v, sigma = params
+            switch_prob = (1.0 - stay_prob) / 2.0
+            current_trans_state = np.full((3, 3), switch_prob, dtype=np.float64)
+            np.fill_diagonal(current_trans_state, stay_prob)
+            trans_space = self._build_spatial_transition_matrices(
+                n_bins, dt=dt, dx=dx, v=v, sigma=sigma,
+            )
+            _, data_ll = self._hmm_forward_filter(
+                seq_likelihood, current_trans_state, trans_space,
+            )
+            return -data_ll
+
+        # ------ optimise ------
+        bounds = [(0.50, 0.99), (-1500.0, 1500.0), (5.0, 50.0)]
+        initial_guess = [0.98, 0.0, 20.0]
+        result = minimize(
+            neg_loglik, initial_guess, bounds=bounds, method='L-BFGS-B',
+        )
+
+        opt_stay, opt_v, opt_sigma = result.x
+
+        # ------ final inference with optimal params ------
+        switch_prob = (1.0 - opt_stay) / 2.0
+        opt_trans_state = np.full((3, 3), switch_prob, dtype=np.float64)
+        np.fill_diagonal(opt_trans_state, opt_stay)
+
+        trans_space = self._build_spatial_transition_matrices(
+            n_bins, dt=dt, dx=dx, v=opt_v, sigma=opt_sigma,
+        )
+        causal_joint, _ = self._hmm_forward_filter(
+            seq_likelihood, opt_trans_state, trans_space,
+        )
+        acausal_joint = self._hmm_backward_smoother(
+            causal_joint, opt_trans_state, trans_space,
+        )
+
+        max_log_likelihood = -result.fun
+        return opt_stay, opt_v, opt_sigma, max_log_likelihood, acausal_joint
+
+    # ==========================================================
+    # BLOCK 5: Step 4 - Evaluation & Statistics
+    # ==========================================================
 
     def _get_jd(self, posteriors, jump_stat="mean"):
         """Calculate jump distance for posterior matrices"""
@@ -1328,7 +1354,7 @@ class Decode1d:
             if method == "neuron_id":
                 shuffled_tc = self.ratemap.tuning_curves.copy()
                 np.random.default_rng(seed).shuffle(shuffled_tc)
-                raw_posterior = self.decode_cpu(spkcount, shuffled_tc)
+                raw_posterior = self._compute_memoryless_bayesian(spkcount, shuffled_tc)
                 marginal_posterior = np.sum(raw_posterior, axis=2)
                 shuffle_posteriors = np.hsplit(marginal_posterior, cum_nbins)
             elif method == "column_cycle":
@@ -1339,6 +1365,10 @@ class Decode1d:
             delayed(_single_shuffle)(i) for i in tqdm(range(n_iter), desc="Shuffling (CPU)")
         )
         return np.array(score)
+
+    # ==========================================================
+    # BLOCK 6: Step 5 - Visualization
+    # ==========================================================
 
     def plot_summary(
         self, 
